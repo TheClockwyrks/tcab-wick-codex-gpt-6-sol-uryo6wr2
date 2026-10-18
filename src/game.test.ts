@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { createEngine, ConstantClock } from "@clockwyrks/simple-2d";
+import { createCanvas } from "@napi-rs/canvas";
 import type { InitApi, UpdateApi } from "@clockwyrks/simple-2d";
 import { game } from "./game";
 import { TICK_DT, DAWN_TIME, TICK_HZ } from "./constants";
@@ -53,6 +55,45 @@ async function rig() {
 }
 
 describe("Wick night", () => {
+  it("advances the same state through the Simple 2D engine", async () => {
+    const r = await rig();
+    const canvas = createCanvas(1280, 720) as unknown as HTMLCanvasElement;
+    const engine = createEngine({
+      canvas,
+      surface: {
+        cssWidth: () => 1280,
+        cssHeight: () => 720,
+        dpr: () => 1,
+        events: () => new EventTarget(),
+      },
+      width: 1280,
+      height: 720,
+      clock: new ConstantClock(1000 / 60),
+      game: {
+        initialize: (api) => {
+          api.audio.define("music", { freq: 110, gain: 0, durationMs: 1000 });
+          api.audio.define("hum", { freq: 110, gain: 0, durationMs: 1000 });
+          return [r.initial, r.debug];
+        },
+        update: game.update,
+        render: () => {},
+      },
+    });
+    await engine.initialize();
+    engine.apply((s) => engine.debug.setScreen(s, "playing"));
+    engine.apply((s) => engine.debug.setWeapon(s, 0, "taper", 1));
+    await engine.advance(1);
+    expect(engine.debug.snapshot(engine.state).run.tick).toBe(1);
+    engine.destroy();
+  });
+  it("keeps animation bookkeeping out of the debug snapshot", async () => {
+    const r = await rig();
+    const snap = r.debug.snapshot(r.initial);
+    expect(Object.keys(snap.run)).not.toContain("moving");
+    expect(Object.keys(snap.run)).not.toContain("moveTicks");
+    expect(Object.keys(snap.run)).not.toContain("puffs");
+    expect(snap.run.tick).toBe(0);
+  });
   it("starts at the title and enters a fresh run with Taper", async () => {
     const r = await rig();
     expect(r.initial.screen).toBe("title");
@@ -112,6 +153,17 @@ describe("Wick night", () => {
     expect(s.run.zones.some((z) => z.kind === "slash")).toBe(true);
     s = r.step(s);
     expect(s.run.enemies[0].hp).toBe(15);
+  });
+  it("a posed puddle pulses on its first tick", async () => {
+    const r = await rig();
+    let s = r.debug.setScreen(r.initial, "playing");
+    s = r.debug.setSpawning(s, false);
+    s = r.debug.setEnemyMotion(s, false);
+    s = r.debug.setEnemyContact(s, false);
+    s = r.debug.spawnEnemy(s, "beetle", 50, 0);
+    s = r.debug.spawnPuddle(s, "oil-splash", 0, 0);
+    s = r.step(s);
+    expect(s.run.enemies[0].hp).toBe(21);
   });
   it("Halo pulses on its weapon rhythm", async () => {
     const r = await rig();

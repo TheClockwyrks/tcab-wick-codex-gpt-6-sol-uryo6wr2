@@ -89,6 +89,7 @@ export interface ZoneState {
   readonly id: number;
   readonly weapon: WeaponId;
   readonly kind: ZoneKind;
+  readonly pulseOrigin?: number;
   readonly x: number;
   readonly y: number;
   readonly radius: number;
@@ -153,6 +154,7 @@ export interface RunState {
 
 export interface WickState {
   readonly screen: Screen;
+  readonly armedMenu: number;
   readonly menuIndex: number;
   readonly almanacTab: number;
   readonly almanacScroll: number;

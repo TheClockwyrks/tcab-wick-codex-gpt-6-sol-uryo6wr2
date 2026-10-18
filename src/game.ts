@@ -113,6 +113,7 @@ const freshRun = (): RunState => ({
 });
 const initial = (): WickState => ({
   screen: "title",
+  armedMenu: -1,
   menuIndex: 0,
   almanacTab: 0,
   almanacScroll: 0,
@@ -156,7 +157,19 @@ const pool = (r: RunState): C.OfferId[] => [
 const offers = (r: RunState): RunState => {
   const candidates = pool(r);
   const out: C.OfferId[] = [];
-  if (r.nextOffers) return { ...r, offers: r.nextOffers, nextOffers: null };
+  if (r.nextOffers) {
+    const proposed = r.nextOffers;
+    const valid =
+      (proposed.length >= 1 &&
+        proposed.length <= C.OFFER_COUNT &&
+        new Set(proposed).size === proposed.length &&
+        proposed.every((id) => candidates.includes(id))) ||
+      (candidates.length === 0 &&
+        proposed.length === 1 &&
+        proposed[0] === C.LAMP_OIL_ID);
+    if (valid) return { ...r, offers: proposed, nextOffers: null };
+    r = { ...r, nextOffers: null };
+  }
   while (candidates.length && out.length < C.OFFER_COUNT) {
     const i = Math.floor(Math.random() * candidates.length);
     out.push(candidates.splice(i, 1)[0]);
@@ -237,7 +250,7 @@ function select(s: WickState, index: number): WickState {
 }
 function spawn(r: RunState, type: C.EnemyId, x: number, y: number): RunState {
   const e = C.ENEMIES[type],
-    d = dist(r.player.x - x, r.player.y - y) || 1;
+    d = dist(r.player.x - x, r.player.y - y);
   const hp =
     e.hp *
     (e.rank === "common"
@@ -255,7 +268,9 @@ function spawn(r: RunState, type: C.EnemyId, x: number, y: number): RunState {
         y,
         hp,
         maxHp: hp,
-        heading: { x: (r.player.x - x) / d, y: (r.player.y - y) / d },
+        heading: d
+          ? { x: (r.player.x - x) / d, y: (r.player.y - y) / d }
+          : { x: r.player.facing === "right" ? 1 : -1, y: 0 },
         age: 0,
         contactCooldown: 0,
       },
@@ -306,6 +321,7 @@ function fire(r: RunState, w: WeaponSlot): RunState {
           id: next.nextId,
           weapon: id,
           kind,
+          ...(kind === "puddle" ? { pulseOrigin: next.tick } : {}),
           x,
           y,
           radius,
@@ -393,8 +409,15 @@ function fire(r: RunState, w: WeaponSlot): RunState {
   else if (base === "oil-splash")
     for (let i = 0; i < amount; i++) {
       const offset = next.nextPuddleOffset;
-      const x = p.x + (offset?.x ?? (Math.random() - 0.5) * C.OIL_SCATTER * 2),
-        y = p.y + (offset?.y ?? (Math.random() - 0.5) * C.OIL_SCATTER * 2);
+      const valid =
+        offset &&
+        Number.isFinite(offset.x) &&
+        Number.isFinite(offset.y) &&
+        dist(offset.x, offset.y) <= C.OIL_SCATTER;
+      const angle = valid ? 0 : Math.random() * Math.PI * 2;
+      const distance = valid ? 0 : Math.sqrt(Math.random()) * C.OIL_SCATTER;
+      const x = p.x + (valid ? offset.x : Math.cos(angle) * distance),
+        y = p.y + (valid ? offset.y : Math.sin(angle) * distance);
       zone("puddle", x, y, rad, row.duration);
       next = { ...next, nextPuddleOffset: null };
     }
@@ -418,12 +441,16 @@ function fire(r: RunState, w: WeaponSlot): RunState {
   return next;
 }
 function chest(r: RunState): RunState {
-  for (const e of C.EVOLUTION_IDS) {
-    const recipe = C.EVOLUTIONS[e],
-      w = r.weapons.find(
-        (v) => v.id === recipe.from && v.level === C.MAX_WEAPON_LEVEL,
-      );
-    if (w && r.passives.some((p) => p.id === recipe.passive))
+  const posed = r.nextChestItem;
+  r = { ...r, nextChestItem: null };
+  for (const w of r.weapons) {
+    if (w.level !== C.MAX_WEAPON_LEVEL) continue;
+    const e = C.EVOLUTION_IDS.find(
+      (e) =>
+        C.EVOLUTIONS[e].from === w.id &&
+        r.passives.some((p) => p.id === C.EVOLUTIONS[e].passive),
+    );
+    if (e)
       return {
         ...r,
         weapons: r.weapons.map((v) =>
@@ -441,7 +468,7 @@ function chest(r: RunState): RunState {
       .map((p) => p.id),
   ];
   const choice =
-    choices.find((v) => v === r.nextChestItem) ??
+    choices.find((v) => v === posed) ??
     choices[Math.floor(Math.random() * choices.length)];
   if (choice) {
     const weapons = r.weapons.map((w) =>
@@ -479,6 +506,13 @@ function simulate(
   dy: number,
   audio: UpdateApi["audio"],
 ): WickState {
+  const heard = new Set<string>();
+  const play = (cue: string) => {
+    if (!heard.has(cue)) {
+      heard.add(cue);
+      audio.play(cue);
+    }
+  };
   let r: RunState = {
     ...s.run,
     tick: s.run.tick + 1,
@@ -506,26 +540,44 @@ function simulate(
     enemies: r.enemies.map((e) => {
       const age = e.age + C.TICK_DT;
       let heading = e.heading;
-      if (e.type !== "gnat") {
-        const d = dist(r.player.x - e.x, r.player.y - e.y) || 1;
-        heading = { x: (r.player.x - e.x) / d, y: (r.player.y - e.y) / d };
-      }
       let x = e.x,
         y = e.y;
       if (s.enemyMotion) {
-        x += heading.x * C.ENEMIES[e.type].speed * C.TICK_DT;
-        y += heading.y * C.ENEMIES[e.type].speed * C.TICK_DT;
         if (e.type === "wisp") {
-          x +=
-            -heading.y *
-            C.WISP_AMPLITUDE *
-            Math.sin((2 * Math.PI * age) / C.WISP_PERIOD) *
-            C.TICK_DT;
-          y +=
-            heading.x *
-            C.WISP_AMPLITUDE *
-            Math.sin((2 * Math.PI * age) / C.WISP_PERIOD) *
-            C.TICK_DT;
+          const oldOffset =
+            C.WISP_AMPLITUDE * Math.sin((2 * Math.PI * e.age) / C.WISP_PERIOD);
+          const ax = e.x + e.heading.y * oldOffset,
+            ay = e.y - e.heading.x * oldOffset;
+          const distance = dist(r.player.x - ax, r.player.y - ay);
+          if (distance > 0) {
+            heading = {
+              x: (r.player.x - ax) / distance,
+              y: (r.player.y - ay) / distance,
+            };
+            const nx = ax + heading.x * C.ENEMIES[e.type].speed * C.TICK_DT;
+            const ny = ay + heading.y * C.ENEMIES[e.type].speed * C.TICK_DT;
+            const offset =
+              C.WISP_AMPLITUDE * Math.sin((2 * Math.PI * age) / C.WISP_PERIOD);
+            x = nx - heading.y * offset;
+            y = ny + heading.x * offset;
+          }
+        } else {
+          if (e.type !== "gnat") {
+            const distance = dist(r.player.x - e.x, r.player.y - e.y);
+            if (distance > 0)
+              heading = {
+                x: (r.player.x - e.x) / distance,
+                y: (r.player.y - e.y) / distance,
+              };
+            else heading = { ...e.heading };
+          }
+          if (
+            e.type === "gnat" ||
+            dist(r.player.x - e.x, r.player.y - e.y) > 0
+          ) {
+            x += heading.x * C.ENEMIES[e.type].speed * C.TICK_DT;
+            y += heading.y * C.ENEMIES[e.type].speed * C.TICK_DT;
+          }
         }
       }
       return {
@@ -576,6 +628,14 @@ function simulate(
   for (const w of r.weapons.filter(
     (w) => w.id === "halo" || w.id === "corona" || w.id === "chandelier",
   )) {
+    if (w.id === "chandelier") {
+      const expected = levelRow(w).amount + st.amount;
+      if (
+        r.zones.filter((z) => z.weapon === "chandelier" && z.kind === "lantern")
+          .length !== expected
+      )
+        r = { ...r, zones: r.zones.filter((z) => z.weapon !== "chandelier") };
+    }
     if (!r.zones.some((z) => z.weapon === w.id)) {
       const row = levelRow(w);
       if (w.id === "chandelier")
@@ -613,6 +673,7 @@ function simulate(
     ),
   };
   const previousIds = new Set(s.run.projectiles.map((p) => p.id));
+  const previousZoneIds = new Set(s.run.zones.map((z) => z.id));
   r = {
     ...r,
     projectiles: r.projectiles
@@ -652,7 +713,12 @@ function simulate(
       .filter((p) => p.ttl > 0),
     zones: r.zones
       .map((z) => {
-        const ttl = z.ttl === null ? null : tickDown(z.ttl);
+        const ttl =
+          z.ttl === null
+            ? null
+            : previousZoneIds.has(z.id)
+              ? tickDown(z.ttl)
+              : z.ttl;
         let x = z.x,
           y = z.y;
         if (z.kind === "aura") {
@@ -677,10 +743,19 @@ function simulate(
           x = r.player.x + Math.cos(a) * row.orbit * st.area;
           y = r.player.y + Math.sin(a) * row.orbit * st.area;
         }
+        const held = r.weapons.find((w) => w.id === z.weapon);
+        const live =
+          held &&
+          (z.kind === "aura" ||
+            (z.kind === "lantern" && z.weapon === "chandelier"))
+            ? levelRow(held)
+            : null;
         return {
           ...z,
           x,
           y,
+          radius: live ? live.radius * st.area : z.radius,
+          damage: live ? live.damage * st.damage : z.damage,
           ttl,
           hits: z.hits
             .map((h) => ({ ...h, cooldown: tickDown(h.cooldown) }))
@@ -704,7 +779,7 @@ function simulate(
           cooldown: p.pierce === C.INFINITE_PIERCE ? C.SHARD_REHIT : p.ttl,
         });
         if (pierce !== C.INFINITE_PIERCE) pierce--;
-        audio.play(C.CUES.hit);
+        play(C.CUES.hit);
       }
     }
     r = {
@@ -721,18 +796,11 @@ function simulate(
             s.run.weapons.find((w) => w.id === z.weapon)?.cooldown ?? 0,
           ) === 0
         : z.kind === "puddle"
-          ? Math.round(
-              ((levelRow(
-                r.weapons.find((w) => w.id === z.weapon) ?? {
-                  id: z.weapon,
-                  level: 1,
-                  cooldown: 0,
-                },
-              ).duration ?? 0) -
-                (z.ttl ?? 0)) *
-                C.TICK_HZ,
-            ) %
-              Math.round(C.OIL_PULSE * C.TICK_HZ) ===
+          ? (r.tick - (z.pulseOrigin ?? r.tick)) %
+              Math.round(
+                (z.weapon === "blaze" ? C.BLAZE_PULSE : C.OIL_PULSE) *
+                  C.TICK_HZ,
+              ) ===
             0
           : true;
     if (
@@ -754,10 +822,20 @@ function simulate(
         !hits.some((h) => h.enemy === e.id) &&
         !(z.kind === "burst" && C.FLARE_IMMUNE.includes(e.type))
       ) {
+        const coronaKill =
+          z.weapon === "corona" && e.hp > 0 && e.hp <= z.damage;
         r = damage(r, e.id, z.damage);
+        if (coronaKill)
+          r = {
+            ...r,
+            player: {
+              ...r.player,
+              hp: Math.min(st.maxHp, r.player.hp + C.CORONA_HEAL),
+            },
+          };
         if (z.kind === "lantern")
           hits.push({ enemy: e.id, cooldown: C.LANTERN_REHIT });
-        audio.play(C.CUES.hit);
+        play(C.CUES.hit);
         if (z.weapon === "pyre")
           r = {
             ...r,
@@ -781,7 +859,7 @@ function simulate(
     puffs: [...r.puffs, ...dead.map((e) => ({ x: e.x, y: e.y, age: 0 }))],
   };
   for (const e of dead) {
-    audio.play(C.CUES.kill);
+    play(C.CUES.kill);
     if (s.drops) {
       const kind = C.ENEMIES[e.type].drop;
       if (kind === "chest")
@@ -842,7 +920,7 @@ function simulate(
             v.id === e.id ? { ...v, contactCooldown: C.CONTACT_COOLDOWN } : v,
           ),
         };
-        audio.play(C.CUES.hurt);
+        play(C.CUES.hurt);
       }
     }
   let chestOpen = false;
@@ -865,8 +943,8 @@ function simulate(
     if (p.kind === "chest") {
       r = chest(r);
       chestOpen = true;
-      audio.play(C.CUES.chest);
-    } else audio.play(C.CUES.pickup);
+      if (r.chestResult?.kind === "evolve") play(C.CUES.evolve);
+    } else play(C.CUES.pickup);
   }
   const oldGems = new Set(s.run.gems.map((g) => g.id));
   const gems = [] as RunState["gems"] extends readonly (infer T)[]
@@ -884,7 +962,7 @@ function simulate(
       y = g.y + (d ? ((r.player.y - g.y) / d) * step : 0);
     if (dist(x - r.player.x, y - r.player.y) <= C.COLLECT_RADIUS) {
       xp += C.GEM_VALUES[g.tier] * st.xp;
-      audio.play(C.CUES.gem);
+      play(C.CUES.gem);
     } else gems.push({ ...g, x, y, attracted });
   }
   if (s.progression)
@@ -892,7 +970,6 @@ function simulate(
       xp -= levelNeed(level);
       level++;
       pending++;
-      audio.play(C.CUES.levelUp);
     }
   r = { ...r, gems, xp, level, pendingLevelUps: pending };
   if (s.despawning)
@@ -919,9 +996,17 @@ function simulate(
         ).length;
       if (commons < row.cap) {
         const type =
-            r.nextSpawnType ??
-            row.types[Math.floor(Math.random() * row.types.length)],
-          angle = ((r.nextSpawnAngle ?? Math.random() * 360) * Math.PI) / 180;
+            r.nextSpawnType && row.types.includes(r.nextSpawnType)
+              ? r.nextSpawnType
+              : row.types[Math.floor(Math.random() * row.types.length)],
+          posedAngle =
+            r.nextSpawnAngle !== null &&
+            Number.isFinite(r.nextSpawnAngle) &&
+            r.nextSpawnAngle >= 0 &&
+            r.nextSpawnAngle < 360
+              ? r.nextSpawnAngle
+              : null,
+          angle = ((posedAngle ?? Math.random() * 360) * Math.PI) / 180;
         r = spawn(
           r,
           type,
@@ -936,16 +1021,22 @@ function simulate(
   }
   if (s.events)
     for (const event of C.EVENTS) {
-      if (time >= event.time && !r.firedEvents.includes(event.time)) {
-        const angle =
-          ((r.nextSwarmAngle ?? r.nextSpawnAngle ?? Math.random() * 360) *
-            Math.PI) /
-          180;
+      if (
+        r.tick === Math.round(event.time * C.TICK_HZ) &&
+        !r.firedEvents.includes(event.time)
+      ) {
+        const raw =
+          event.kind === "swarm" ? r.nextSwarmAngle : r.nextSpawnAngle;
+        const posed =
+          raw !== null && Number.isFinite(raw) && raw >= 0 && raw < 360
+            ? raw
+            : null;
+        const angle = ((posed ?? Math.random() * 360) * Math.PI) / 180;
         r = {
           ...r,
           firedEvents: [...r.firedEvents, event.time],
-          nextSwarmAngle: null,
-          nextSpawnAngle: null,
+          nextSwarmAngle: event.kind === "swarm" ? null : r.nextSwarmAngle,
+          nextSpawnAngle: event.kind === "spawn" ? null : r.nextSpawnAngle,
         };
         if (event.kind === "spawn")
           r = spawn(
@@ -967,21 +1058,37 @@ function simulate(
                 Math.sin(angle) * C.SPAWN_DISTANCE +
                 Math.cos(angle) * q,
             );
+            r = {
+              ...r,
+              enemies: r.enemies.map((e) =>
+                e.id === r.nextId - 1
+                  ? {
+                      ...e,
+                      heading: { x: -Math.cos(angle), y: -Math.sin(angle) },
+                    }
+                  : e,
+              ),
+            };
           }
       }
     }
   if (time >= C.DAWN_TIME) {
-    audio.play(C.CUES.dawn);
+    play(C.CUES.dawn);
     return { ...s, screen: "dawn", run: r, menuIndex: 0 };
   }
   if (r.player.hp <= 0) {
-    audio.play(C.CUES.fallen);
+    play(C.CUES.fallen);
     return { ...s, screen: "fallen", run: r, menuIndex: 0 };
   }
 
-  if (chestOpen) return { ...s, screen: "chest", run: r, menuIndex: 0 };
-  if (pending > 0)
+  if (chestOpen) {
+    play(C.CUES.chest);
+    return { ...s, screen: "chest", run: r, menuIndex: 0 };
+  }
+  if (pending > 0) {
+    play(C.CUES.levelUp);
     return { ...s, screen: "levelup", run: offers(r), menuIndex: 0 };
+  }
   return { ...s, run: r };
 }
 export interface WickRect {
@@ -1168,13 +1275,15 @@ const menuRects = (s: DeepReadonly<WickState>): WickRect[] => {
             },
   );
 };
-const tabRects = (): WickRect[] =>
-  C.ALMANAC_TABS.map((_, i) => ({
-    x: 90 + i * 272,
-    y: 88,
-    width: 255,
-    height: 56,
-  }));
+const tabRects = (state: DeepReadonly<WickState>): WickRect[] =>
+  state.screen !== "almanac"
+    ? []
+    : C.ALMANAC_TABS.map((_, i) => ({
+        x: 90 + i * 272,
+        y: 88,
+        width: 255,
+        height: 56,
+      }));
 const almanacEntries = (tab: number): string[] =>
   tab === 0
     ? [...C.BASE_WEAPON_IDS, ...C.EVOLUTION_IDS]
@@ -1184,12 +1293,28 @@ const almanacEntries = (tab: number): string[] =>
         ? [...C.ENEMY_IDS]
         : [...C.GEM_TIERS, ...C.PICKUP_KINDS];
 const snapshot = (s: DeepReadonly<WickState>) => {
+  const { armedMenu: _armedMenu, ...visibleState } = s;
+  void _armedMenu;
   const r = s.run,
     st = stats(r as RunState);
+  const {
+    moving: _moving,
+    moveTicks: _moveTicks,
+    puffs: _puffs,
+    ...visibleRun
+  } = r;
+  void _moving;
+  void _moveTicks;
+  void _puffs;
   return {
-    ...s,
+    ...visibleState,
     run: {
-      ...r,
+      ...visibleRun,
+      zones: r.zones.map((z) => {
+        const { pulseOrigin: _pulseOrigin, ...visible } = z;
+        void _pulseOrigin;
+        return visible;
+      }),
       time: r.tick / C.TICK_HZ,
       xpToNext: levelNeed(r.level),
       maxHp: st.maxHp,
@@ -1218,12 +1343,18 @@ const debug: WickDebugApi = {
   setScreen: (s, name) => ({
     ...writable(s),
     screen: name,
+    armedMenu: -1,
     menuIndex: 0,
     almanacTab: 0,
     almanacScroll: 0,
-    accumulator: 0,
+    accumulator:
+      s.screen === "playing" && name !== "playing" ? 0 : s.accumulator,
   }),
-  choose: (s, index) => select(writable(s), index),
+  choose: (s, index) => {
+    if (!Number.isInteger(index) || index < 0 || index >= s.run.offers.length)
+      throw new Error("Invalid offer index");
+    return select({ ...writable(s), screen: "levelup" }, index);
+  },
   setSpawning: (s, on) => ({ ...writable(s), spawning: on }),
   setEvents: (s, on) => ({ ...writable(s), events: on }),
   setDespawning: (s, on) => ({ ...writable(s), despawning: on }),
@@ -1263,7 +1394,12 @@ const debug: WickDebugApi = {
     mutateRun(s, { nextOffers: [...nextOffers] }),
   setWeapon: (s, slot, id, level) =>
     mutateRun(s, {
-      weapons: put(s.run.weapons, slot, { id, level, cooldown: 0 }),
+      weapons: put(s.run.weapons, slot, {
+        id,
+        level,
+        cooldown:
+          s.run.weapons[slot]?.id === id ? s.run.weapons[slot].cooldown : 0,
+      }),
     }),
   setWeaponCooldown: (s, slot, cooldown) =>
     mutateRun(s, {
@@ -1326,10 +1462,16 @@ const debug: WickDebugApi = {
           y,
           vx,
           vy,
-          ax: 0,
-          ay: 0,
-          radius: row.radius,
-          damage: row.damage,
+          ax:
+            weapon === "sconce"
+              ? (-vx / (dist(vx, vy) || 1)) * C.SCONCE_DECEL
+              : 0,
+          ay:
+            weapon === "sconce"
+              ? (-vy / (dist(vx, vy) || 1)) * C.SCONCE_DECEL
+              : 0,
+          radius: row.radius * stats(s.run as RunState).area,
+          damage: row.damage * stats(s.run as RunState).damage,
           ttl: row.duration,
           pierce,
           hits: [],
@@ -1354,10 +1496,11 @@ const debug: WickDebugApi = {
           id: s.run.nextId,
           weapon,
           kind: "puddle",
+          pulseOrigin: s.run.tick + 1,
           x,
           y,
-          radius: row.radius,
-          damage: row.damage,
+          radius: row.radius * stats(s.run as RunState).area,
+          damage: row.damage * stats(s.run as RunState).damage,
           ttl: row.duration,
           hits: [],
         },
@@ -1395,7 +1538,6 @@ function contains(rect: WickRect, x: number, y: number) {
     y < rect.y + rect.height
   );
 }
-let armed = -1;
 function handleInput(current: WickState, api: UpdateApi): WickState {
   let s = current;
   const edges = Object.fromEntries(
@@ -1411,7 +1553,24 @@ function handleInput(current: WickState, api: UpdateApi): WickState {
         ? almanacEntries(s.almanacTab).length
         : menuRects(s).length;
     if ((edges.up || edges.down) && n) {
-      s = { ...s, menuIndex: (s.menuIndex + (edges.down ? 1 : -1) + n) % n };
+      const menuIndex = (s.menuIndex + (edges.down ? 1 : -1) + n) % n;
+      s = {
+        ...s,
+        menuIndex,
+        almanacScroll:
+          screen === "almanac"
+            ? Math.max(
+                0,
+                Math.min(
+                  Math.max(0, n - C.ALMANAC_ROWS),
+                  Math.max(
+                    Math.min(s.almanacScroll, menuIndex),
+                    menuIndex - C.ALMANAC_ROWS + 1,
+                  ),
+                ),
+              )
+            : s.almanacScroll,
+      };
       api.audio.play(C.CUES.menuMove);
     }
     if (screen === "almanac" && (edges.left || edges.right)) {
@@ -1438,7 +1597,10 @@ function handleInput(current: WickState, api: UpdateApi): WickState {
       s = { ...s, screen: "playing" };
     else if (edges.confirm && screen !== "almanac" && screen !== "howto") {
       s = select(s, s.menuIndex);
-      api.audio.play(C.CUES.menuConfirm);
+      if (screen === "levelup") {
+        api.audio.play(C.CUES.choose);
+        if (s.screen === "levelup") api.audio.play(C.CUES.levelUp);
+      } else if (screen !== "chest") api.audio.play(C.CUES.menuConfirm);
     }
   }
   const pointer = api.input.pointer(),
@@ -1449,32 +1611,39 @@ function handleInput(current: WickState, api: UpdateApi): WickState {
       i = rects.findIndex((rect) => contains(rect, pointer.x, pointer.y));
     const ti =
       screen === "almanac"
-        ? tabRects().findIndex((rect) => contains(rect, pointer.x, pointer.y))
+        ? tabRects(s).findIndex((rect) => contains(rect, pointer.x, pointer.y))
         : -1;
-    if (pressed) armed = ti >= 0 ? 100 + ti : i;
+    if (pressed) s = { ...s, armedMenu: ti >= 0 ? 100 + ti : i };
     if (released) {
-      if (armed === i && i >= 0 && ti < 0) {
+      if (s.armedMenu === i && i >= 0 && ti < 0) {
         if (screen === "almanac") s = { ...s, menuIndex: s.almanacScroll + i };
         else if (screen === "howto")
           s = { ...s, screen: "title", menuIndex: 2 };
         else s = select({ ...s, menuIndex: i }, i);
-        api.audio.play(C.CUES.menuConfirm);
+        if (screen === "levelup") {
+          api.audio.play(C.CUES.choose);
+          if (s.screen === "levelup") api.audio.play(C.CUES.levelUp);
+        } else if (
+          screen !== "chest" &&
+          screen !== "howto" &&
+          screen !== "almanac"
+        )
+          api.audio.play(C.CUES.menuConfirm);
       }
-      if (armed === 100 + ti && ti >= 0) {
+      if (s.armedMenu === 100 + ti && ti >= 0) {
         s = { ...s, almanacTab: ti, almanacScroll: 0, menuIndex: 0 };
         api.audio.play(C.CUES.menuMove);
       }
-      armed = -1;
+      s = { ...s, armedMenu: -1 };
     } else if (pressed && i >= 0 && screen === "almanac")
       s = { ...s, menuIndex: s.almanacScroll + i };
     else if (
       !pointer.down &&
       pointer.device === "mouse" &&
       i >= 0 &&
-      s.menuIndex !== i &&
-      screen !== "almanac"
+      s.menuIndex !== (screen === "almanac" ? s.almanacScroll + i : i)
     ) {
-      s = { ...s, menuIndex: i };
+      s = { ...s, menuIndex: screen === "almanac" ? s.almanacScroll + i : i };
       api.audio.play(C.CUES.menuMove);
     }
     if (screen === "almanac") {
@@ -1486,13 +1655,12 @@ function handleInput(current: WickState, api: UpdateApi): WickState {
           ...s,
           almanacScroll: Math.max(
             0,
-            Math.min(count - C.ALMANAC_ROWS, s.almanacScroll + rows),
+            Math.min(
+              Math.max(0, count - C.ALMANAC_ROWS),
+              s.almanacScroll + rows,
+            ),
           ),
         };
-      if (s.menuIndex < s.almanacScroll)
-        s = { ...s, almanacScroll: s.menuIndex };
-      if (s.menuIndex >= s.almanacScroll + C.ALMANAC_ROWS)
-        s = { ...s, almanacScroll: s.menuIndex - C.ALMANAC_ROWS + 1 };
     }
   }
   return s;
@@ -1666,6 +1834,21 @@ function text(
   ctx.textAlign = align;
   ctx.fillText(value, x, y);
 }
+function fitText(
+  ctx: CanvasRenderingContext2D,
+  value: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+) {
+  let size = 18;
+  do {
+    ctx.font = `600 ${size}px Georgia, serif`;
+    if (ctx.measureText(value).width <= maxWidth) break;
+    size--;
+  } while (size > 12);
+  text(ctx, value, x, y, size);
+}
 function panel(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -1720,6 +1903,16 @@ function hud(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
     const v = i < 6 ? r.weapons[i] : r.passives[i - 6];
     if (v) {
       drawImg(ctx, img(C.ICON_PATHS[v.id]), x + 27, y + 22, 30, 30);
+      const pipMax =
+        i < 6
+          ? evolved(v.id as C.WeaponId)
+            ? 1
+            : C.MAX_WEAPON_LEVEL
+          : C.PASSIVES[v.id as C.PassiveId].maxLevel;
+      for (let j = 0; j < pipMax; j++) {
+        ctx.fillStyle = j < v.level ? "#eac17c" : "#465059";
+        ctx.fillRect(x + 4 + j * 5.8, y + 3, 4, 3);
+      }
       text(ctx, String(v.level), x + 45, y + 49, 13, "#ffe1a0", "right");
       if (i < 6) {
         ctx.fillStyle = "#2c181e";
@@ -1799,7 +1992,7 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
     text(ctx, "BACK  ·  ESC", 640, 646, 24, "#efc37d", "center");
   } else if (s.screen === "almanac") {
     text(ctx, C.ALMANAC_TEXT, 90, 62, 42);
-    tabRects().forEach((q, i) => {
+    tabRects(s).forEach((q, i) => {
       panel(ctx, q.x, q.y, q.width, q.height);
       text(
         ctx,
@@ -1829,6 +2022,23 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
     text(ctx, nameOf(selected), 646, 224, 36, "#ffe0a4");
     if (s.almanacTab === 0) {
       drawImg(ctx, img(C.ICON_PATHS[selected as C.OfferId]), 740, 338, 95, 95);
+      const effect = C.EFFECT_SPRITES[selected as C.WeaponId];
+      const effectImage =
+        effect.frames === 1
+          ? img(effect.path)
+          : sheet(
+              effect.path,
+              Math.floor(s.simTime / C.WALK_FRAME_TIME) % effect.frames,
+            );
+      const scale = Math.min(180 / effect.width, 100 / effect.height);
+      drawImg(
+        ctx,
+        effectImage,
+        985,
+        338,
+        effect.width * scale,
+        effect.height * scale,
+      );
       const row = levelRow({
         id: selected as C.WeaponId,
         level: 1,
@@ -1836,7 +2046,13 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
       });
       text(ctx, `DAMAGE  ${row.damage}`, 646, 450);
       if (row.cooldown) text(ctx, `COOLDOWN  ${row.cooldown}s`, 646, 485);
-      text(ctx, C.WEAPON_DESCRIPTIONS[selected as C.WeaponId], 646, 570, 18);
+      fitText(
+        ctx,
+        C.WEAPON_DESCRIPTIONS[selected as C.WeaponId],
+        646,
+        570,
+        520,
+      );
     }
     if (s.almanacTab === 1) {
       drawImg(
@@ -1853,7 +2069,13 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
         646,
         460,
       );
-      text(ctx, C.PASSIVE_DESCRIPTIONS[selected as C.PassiveId], 646, 570, 18);
+      fitText(
+        ctx,
+        C.PASSIVE_DESCRIPTIONS[selected as C.PassiveId],
+        646,
+        570,
+        520,
+      );
     }
     if (s.almanacTab === 2) {
       const id = selected as C.EnemyId,
@@ -1876,7 +2098,7 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
         460,
         19,
       );
-      text(ctx, C.ENEMY_DESCRIPTIONS[id], 646, 570, 18);
+      fitText(ctx, C.ENEMY_DESCRIPTIONS[id], 646, 570, 520);
     }
     if (s.almanacTab === 3) {
       const gem = C.GEM_TIERS.includes(selected as C.GemTier);
@@ -1892,14 +2114,24 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
         92,
         92,
       );
-      text(
+      if (gem)
+        text(
+          ctx,
+          `EXPERIENCE  ${C.GEM_VALUES[selected as C.GemTier]}`,
+          646,
+          460,
+          20,
+        );
+      else if (selected === "bread")
+        text(ctx, `HEALS  ${C.BREAD_HEAL}`, 646, 460, 20);
+      fitText(
         ctx,
         gem
           ? C.GEM_DESCRIPTIONS[selected as C.GemTier]
           : C.PICKUP_DESCRIPTIONS[selected as C.PickupKind],
         646,
         570,
-        18,
+        520,
       );
     }
     text(ctx, "ESC  BACK    ·    ↑↓ BROWSE    ·    ←→ TABS", 92, 688, 18);
@@ -1913,6 +2145,18 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
     s.run.offers.forEach((id, i) => {
       const q = menuRects(s)[i];
       drawImg(ctx, img(C.ICON_PATHS[id]), q.x + 49, q.y + 45, 42, 42);
+      const held =
+        s.run.weapons.find((w) => w.id === id) ??
+        s.run.passives.find((p) => p.id === id);
+      text(
+        ctx,
+        held ? `${C.LEVEL_LABEL} ${held.level + 1}` : C.OFFER_NEW_TEXT,
+        q.x + q.width - 22,
+        q.y + q.height / 2 + 6,
+        16,
+        "#edc487",
+        "right",
+      );
     });
     const id = s.run.offers[s.menuIndex];
     if (id)
@@ -1938,7 +2182,14 @@ function render(ctx: CanvasRenderingContext2D, s: DeepReadonly<WickState>) {
         : result?.kind === "level"
           ? `${nameOf(result.item)}  LEVEL ${result.level}`
           : "THE LAMP IS RESTORED";
-    text(ctx, label, 640, 361, 32, "#fce6bd", "center");
+    const icon =
+      result?.kind === "evolve"
+        ? result.weapon
+        : result?.kind === "level"
+          ? result.item
+          : C.LAMP_OIL_ID;
+    drawImg(ctx, img(C.ICON_PATHS[icon]), 640, 318, 64, 64);
+    text(ctx, label, 640, 422, 32, "#fce6bd", "center");
     text(ctx, "CONTINUE", 640, 646, 23, "#f3c67d", "center");
   } else if (s.screen === "paused") {
     text(ctx, C.PAUSED_TEXT, 640, 258, 64, "#ffe0a4", "center");
@@ -2038,7 +2289,8 @@ export const game: Game<WickState, WickDebugApi> = {
         accumulator: s.screen === "playing" ? Math.max(0, accum) : 0,
       };
     } else s = { ...s, accumulator: 0 };
-    if (s.screen === "playing") api.audio.loop(C.CUES.music);
+    if (["playing", "levelup", "chest", "paused"].includes(s.screen))
+      api.audio.loop(C.CUES.music);
     else api.audio.stop(C.CUES.music);
     if (
       s.screen === "playing" &&
